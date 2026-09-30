@@ -1,0 +1,8 @@
+# Python virtual environment and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Demo database (regenerated automatically on first run)
+demo.db
+.demo-*.db
