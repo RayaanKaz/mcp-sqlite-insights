@@ -177,15 +177,33 @@ flowchart LR
 | 3. `query_only` | `PRAGMA query_only = ON` on every connection. | Writes to the main database and to anything attached |
 | 4. Authorizer | A native SQLite callback that allows only read operations while each statement is compiled. | Anything unexpected that gets past layer 1, including `load_extension` |
 
-The test suite attacks each native layer with the others disabled, and checks the database file's hash before and after.
+The test suite attacks each native layer with the others disabled, and checks the database file's hash before and after. It also runs 21 bypass attempts against the full server (stacked statements, comment and string tricks, CTE-wrapped writes, `ATTACH`, `VACUUM INTO`, pragma functions, `load_extension`, an endless recursive query) and checks that each is refused, the database file is unchanged and no new file appears next to it.
 
-**Additional hardening:** `trusted_schema = OFF`; SQLite defensive mode (Python 3.12+); `ATTACH` disabled outright (Python 3.11+); a fresh connection for every call; a 10-second query timeout; memory-bounded fetching (at most 51 rows are ever read from a result); 300-character cell truncation; logs on stderr only.
+**Additional hardening:** `trusted_schema = OFF`; SQLite defensive mode (Python 3.12+); `ATTACH` disabled outright and single values capped at 50 MB (both Python 3.11+); a fresh connection for every call; a 10-second query timeout; memory-bounded fetching (at most 51 rows are ever read from a result); 300-character cell truncation; logs on stderr only.
 
 **What it does not do:**
 
 - **Read-only is not private.** Every row a query returns becomes part of your conversation with the model. Don't connect a database containing data you are not allowed to share with your AI provider.
 - It can read every table in the file. There is no per-table or per-column allowlist yet ([contributions welcome](#contributing)).
 - It is built for local, single-user use over stdio, with no network transport or authentication.
+- **It protects only its own access path.** If Claude also has shell or file tools, as in Claude Code, those tools can reach the database file directly. See below.
+
+### Using it alongside Claude Code
+
+In Claude Desktop with no other file or shell tools connected, this server is Claude's only way to reach the database. Claude Code can also run shell commands and edit files, so protect the file itself:
+
+1. **Keep the database outside your project folder**, for example in `~/data/`.
+2. **Turn on Claude Code's sandbox** with `/sandbox`. Sandboxed commands can write only to the working directory, a temp directory and folders you add, and the operating system enforces this for every process they start.
+3. Optionally, deny the folder explicitly in `.claude/settings.json`:
+
+```json
+{
+  "sandbox": { "filesystem": { "denyWrite": ["~/data"] } },
+  "permissions": { "deny": ["Edit(~/data/**)"] }
+}
+```
+
+Permission rules on their own are not enough: an `Edit` deny rule does not cover a script that opens the file itself, and a rule like `Bash(sqlite3 *)` does not match `/usr/bin/sqlite3`. The sandbox is the OS-level boundary. See Claude Code's [sandboxing](https://code.claude.com/docs/en/sandboxing) and [permissions](https://code.claude.com/docs/en/permissions) docs.
 
 ---
 
@@ -208,7 +226,7 @@ The **demo database** is a small shop: `customers` (40), `products` (15), `order
 python -m unittest -v
 ```
 
-29 tests cover sanitizer bypass attempts, each read-only layer on its own, the timeout, the row cap, Markdown escaping, awkward file names and identifiers, and a full stdio round trip through an MCP client. CI runs them on Linux, Windows, and macOS (Apple Silicon and Intel) with Python 3.10 to 3.13.
+32 tests cover sanitizer bypass attempts, a red-team suite against the full server, each read-only layer on its own, the timeout, the row cap, Markdown escaping, awkward file names and identifiers, and a full stdio round trip through an MCP client. CI runs them on Linux, Windows, and macOS (Apple Silicon and Intel) with Python 3.10 to 3.13.
 
 ## Contributing
 

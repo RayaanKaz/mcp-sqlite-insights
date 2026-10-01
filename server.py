@@ -52,7 +52,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # --------------------------------------------------------------------------- #
 # Settings
@@ -60,6 +60,7 @@ __version__ = "0.1.0"
 
 MAX_ROWS = 50  # Hard cap on rows returned to Claude, to protect its context window.
 MAX_CELL_CHARS = 300  # Long text values are truncated to this many characters.
+MAX_VALUE_BYTES = 50_000_000  # Largest string or BLOB SQLite may build (Python 3.11+).
 QUERY_TIMEOUT_SECONDS = 10.0  # Queries running longer than this are cancelled.
 COUNT_TIMEOUT_SECONDS = 2.0  # Per-table budget for row counts in inspect_schema.
 MAX_DETAILED_TABLES = 25  # Above this, inspect_schema shows an overview only.
@@ -269,8 +270,11 @@ def open_readonly(db_path: Path) -> sqlite3.Connection:
         conn.execute("PRAGMA trusted_schema = OFF")
         if hasattr(conn, "setconfig"):  # Python 3.12+
             conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
-        if hasattr(conn, "setlimit"):  # Python 3.11+: forbid ATTACH entirely.
-            conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+        if hasattr(conn, "setlimit"):  # Python 3.11+
+            conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)  # Forbid ATTACH entirely.
+            # One giant value (e.g. hex(zeroblob(...))) is a single step the timeout
+            # cannot interrupt, so cap value size to keep memory use bounded.
+            conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
         # Layer 4 (installed last, so the setup PRAGMAs above are not subject to it).
         conn.set_authorizer(_authorizer)
     except Exception:
@@ -543,8 +547,8 @@ def _sample_rows(conn: sqlite3.Connection, name: str) -> str:
         cur = conn.execute(f"SELECT * FROM {_quote_ident(name)} LIMIT {SAMPLE_ROWS}")
         headers = [d[0] for d in cur.description]
         rows = cur.fetchall()
-    except sqlite3.OperationalError:
-        return "_Sample rows unavailable (timed out)._"
+    except sqlite3.Error as exc:
+        return f"_Sample rows unavailable ({exc})._"
     finally:
         conn.set_progress_handler(None, 0)
     if not rows:
@@ -587,6 +591,11 @@ def execute_query(sql: str) -> str:
         if "not authorized" in message:
             raise ToolError("Blocked: this server is read-only and the query tried a "
                             "disallowed operation. For schema details, use inspect_schema.") from exc
+        if "too big" in message:
+            raise ToolError(
+                f"A value in this query exceeded the {MAX_VALUE_BYTES // 1_000_000} MB limit. "
+                "Select fewer or smaller columns."
+            ) from exc
         if "no such table: pragma_" in message:  # Pragma functions are refused on SQLite < 3.42.
             message += ". For schema details, use inspect_schema"
         raise ToolError(f"SQLite error: {message}") from exc

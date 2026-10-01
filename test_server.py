@@ -113,10 +113,12 @@ class ReadOnlyLayerTests(DatabaseTestCase):
     ]
 
     def _open(self, authorizer: bool) -> sqlite3.Connection:
-        conn = server.open_readonly(self.db)
-        if not authorizer:
-            conn.set_authorizer(None)  # Simulate a bypass of layer 4 as well.
-        return conn
+        if authorizer:
+            return server.open_readonly(self.db)
+        # Simulate a bypass of layer 4 as well. An allow-all callback is used because
+        # set_authorizer(None) only removes the authorizer on Python 3.11+.
+        with mock.patch.object(server, "_authorizer", lambda *args: sqlite3.SQLITE_OK):
+            return server.open_readonly(self.db)
 
     def _attempt_all(self, authorizer: bool) -> None:
         before = _digest(self.db)
@@ -160,6 +162,20 @@ class ReadOnlyLayerTests(DatabaseTestCase):
             conn.close()
         self.assertEqual(target.stat().st_size, 0)
 
+    @unittest.skipUnless(hasattr(sqlite3.Connection, "setlimit"), "needs Python 3.11+")
+    def test_no_side_files_without_authorizer(self) -> None:
+        # With layers 1 and 4 bypassed, ATTACH and VACUUM INTO could create new files
+        # (never modify the database). The ATTACH limit set on Python 3.11+ stops that.
+        for sql in ["ATTACH DATABASE '{}' AS x", "VACUUM INTO '{}'"]:
+            target = Path(self._tmp.name) / "side.db"
+            conn = self._open(authorizer=False)
+            try:
+                with self.subTest(sql=sql), self.assertRaises(sqlite3.Error):
+                    conn.execute(sql.format(target))
+            finally:
+                conn.close()
+            self.assertFalse(target.exists())
+
     def test_missing_file_is_not_created(self) -> None:
         missing = Path(self._tmp.name) / "nope.db"
         with self.assertRaises(ToolError):
@@ -173,6 +189,52 @@ class ReadOnlyLayerTests(DatabaseTestCase):
                 conn.execute("SELECT load_extension('x')")
         finally:
             conn.close()
+
+
+class RedTeamTests(DatabaseTestCase):
+    """Bypass attempts against the full server; none may run or touch the disk."""
+
+    ATTACKS = {
+        "stacked statements": "SELECT 1; DELETE FROM orders",
+        "semicolon after line comment": "SELECT 1 -- hi\n; DELETE FROM orders",
+        "semicolon after block comment": "SELECT 1 /* x */; DELETE FROM orders",
+        "leading semicolon": "; DELETE FROM orders",
+        "quoted identifier then statement": 'SELECT 1 AS "x"; DELETE FROM orders',
+        "CTE + DELETE": "WITH x AS (SELECT 1) DELETE FROM orders",
+        "recursive CTE + UPDATE": "WITH RECURSIVE x(n) AS (SELECT 1) UPDATE orders SET status = 'x'",
+        "CTE + INSERT": "WITH x AS (SELECT 1) INSERT INTO orders SELECT * FROM orders",
+        "CTE + REPLACE across newline": "WITH x AS (SELECT 1) REPLACE\nINTO orders SELECT * FROM orders",
+        "EXPLAIN a delete": "EXPLAIN DELETE FROM orders",
+        "ATTACH another file": "ATTACH DATABASE '{tmp}/side.db' AS x",
+        "VACUUM INTO a new file": "VACUUM INTO '{tmp}/side.db'",
+        "PRAGMA flip query_only": "PRAGMA query_only = 0",
+        "pragma function query_only": "SELECT * FROM pragma_query_only(0)",
+        "pragma function writable_schema": "SELECT * FROM pragma_writable_schema(1)",
+        "load_extension": "SELECT load_extension('/tmp/evil')",
+        "CREATE TEMP TABLE": "CREATE TEMP TABLE t AS SELECT 1",
+        "BEGIN EXCLUSIVE": "BEGIN EXCLUSIVE",
+        "byte-order mark before DELETE": "\ufeffDELETE FROM orders",
+        "unterminated string hiding a statement": "SELECT 'abc; DELETE FROM orders",
+        "endless recursive CTE": "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) "
+                                 "SELECT COUNT(*) FROM r",
+    }
+
+    def test_attacks_are_refused(self) -> None:
+        before = _digest(self.db)
+        files = sorted(Path(self._tmp.name).iterdir())
+        with mock.patch.object(server, "QUERY_TIMEOUT_SECONDS", 0.2):
+            for name, sql in self.ATTACKS.items():
+                with self.subTest(name), self.assertRaises(ToolError):
+                    server.execute_query(sql.format(tmp=self._tmp.name))
+        self.assertEqual(_digest(self.db), before, "database file was modified")
+        self.assertEqual(sorted(Path(self._tmp.name).iterdir()), files, "a new file was created")
+
+    @unittest.skipUnless(hasattr(sqlite3.Connection, "setlimit"), "needs Python 3.11+")
+    def test_huge_values_are_refused(self) -> None:
+        # A single giant value is one step the timeout cannot interrupt.
+        with self.assertRaisesRegex(ToolError, "MB limit"):
+            server.execute_query("SELECT length(hex(zeroblob(40000000)))")
+        self.assertIn("| 2000000 |", server.execute_query("SELECT length(hex(zeroblob(1000000)))"))
 
 
 class ExecuteQueryTests(DatabaseTestCase):
